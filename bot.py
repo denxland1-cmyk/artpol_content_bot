@@ -17,6 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 
 ALLOWED_USERS = {
+    800204567,    # Денис Акценин (@denxland)
     1670809909,   # Саня
     6016286196,   # Женя Смирнов
     5399664883,   # Паша
@@ -71,8 +72,11 @@ TYPE_LABELS = {
 
 
 def build_caption(data: dict) -> str:
+    from datetime import datetime
     obj_type = TYPE_LABELS.get(data.get("obj_type"), "")
-    return f"{obj_type}\n\n{data.get('text', '')}"
+    date = datetime.now().strftime("%d.%m.%Y")
+    name = data.get("user_name", "")
+    return f"{obj_type}\n📅 {date} | 👷 {name}\n\n{data.get('text', '')}"
 
 
 async def show_preview(message: Message, data: dict):
@@ -115,7 +119,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(ObjectForm.text, F.text)
 async def receive_text(message: Message, state: FSMContext):
-    await state.update_data(text=message.text, media=[])
+    user = message.from_user
+    user_name = user.full_name or user.username or "Неизвестный"
+    await state.update_data(text=message.text, media=[], user_name=user_name)
     await message.answer("Выберите тип объекта:", reply_markup=type_keyboard())
     await state.set_state(ObjectForm.obj_type)
 
@@ -150,6 +156,23 @@ async def receive_video(message: Message, state: FSMContext):
     media.append({"type": "video", "file_id": message.video.file_id})
     await state.update_data(media=media)
     await message.answer(f"🎬 Видео принято (всего: {len(media)}). Ещё или нажмите «Готово».")
+
+
+@router.message(ObjectForm.media, F.document)
+async def receive_document(message: Message, state: FSMContext):
+    mime = message.document.mime_type or ""
+    data = await state.get_data()
+    media = data.get("media", [])
+    if mime.startswith("image/"):
+        media.append({"type": "photo", "file_id": message.document.file_id})
+        await state.update_data(media=media)
+        await message.answer(f"📷 Фото принято (всего: {len(media)}). Ещё или нажмите «Готово».")
+    elif mime.startswith("video/"):
+        media.append({"type": "video", "file_id": message.document.file_id})
+        await state.update_data(media=media)
+        await message.answer(f"🎬 Видео принято (всего: {len(media)}). Ещё или нажмите «Готово».")
+    else:
+        await message.answer("⚠️ Отправьте фото или видео. Другие типы файлов не принимаются.")
 
 
 @router.callback_query(ObjectForm.media, F.data == "media_done")
