@@ -252,7 +252,10 @@ async def send_to_group(callback: CallbackQuery, state: FSMContext, bot: Bot):
             ))
 
     if media_group:
-        await bot.send_media_group(chat_id=GROUP_ID, media=media_group)
+        # Telegram максимум 10 медиа в альбоме — разбиваем на части
+        for chunk_start in range(0, len(media_group), 10):
+            chunk = media_group[chunk_start:chunk_start + 10]
+            await bot.send_media_group(chat_id=GROUP_ID, media=chunk)
     else:
         await bot.send_message(chat_id=GROUP_ID, text=caption, parse_mode="HTML")
 
