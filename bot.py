@@ -1,5 +1,11 @@
 import asyncio
+import logging
 import os
+import re
+from datetime import datetime
+from io import BytesIO
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -15,6 +21,42 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
+
+# ── Яндекс Object Storage (приватный архив контента) ────────
+S3_BUCKET = os.getenv("S3_BUCKET", "artpol-content")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://storage.yandexcloud.net")
+S3_REGION = os.getenv("S3_REGION", "ru-central1")
+S3_ENABLED = bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("content-bot")
+
+MSK = ZoneInfo("Europe/Moscow")
+
+_s3_client = None
+
+
+def get_s3():
+    """Ленивая инициализация boto3-клиента Яндекс Object Storage."""
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        from botocore.config import Config
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            config=Config(signature_version="s3v4"),
+            region_name=S3_REGION,
+        )
+    return _s3_client
+
+
+def _slug(text: str) -> str:
+    """Безопасный фрагмент ключа S3: буквы/цифры (вкл. кириллицу) и дефис, остальное → _."""
+    return re.sub(r"[^\w\-]+", "_", (text or "").strip(), flags=re.UNICODE).strip("_") or "obj"
+
 
 ALLOWED_USERS = {
     800204567,    # Денис Акценин (@denxland)
@@ -74,11 +116,68 @@ TYPE_LABELS = {
 
 
 def build_caption(data: dict) -> str:
-    from datetime import datetime
     obj_type = TYPE_LABELS.get(data.get("obj_type"), "")
-    date = datetime.now().strftime("%d.%m.%Y")
+    date = datetime.now(MSK).strftime("%d.%m.%Y")
     name = data.get("user_name", "")
     return f"{obj_type}\n📅 {date} | 👷 {name}\n\n{data.get('text', '')}"
+
+
+async def archive_media_to_s3(bot: Bot, data: dict) -> int:
+    """Скачивает медиа из Telegram и складывает в приватный бакет Яндекса.
+
+    Возвращает число успешно залитых файлов. Ошибка отдельного файла не
+    прерывает процесс — основная отправка в группу к этому моменту уже сделана.
+    """
+    if not S3_ENABLED:
+        return 0
+    media_list = data.get("media", [])
+    if not media_list:
+        return 0
+
+    now = datetime.now(MSK)
+    obj_type = TYPE_LABELS.get(data.get("obj_type"), "объект")
+    type_clean = obj_type.split(" ", 1)[-1] if " " in obj_type else obj_type  # без эмодзи
+    name = _slug(data.get("user_name", "бригадир"))
+    folder = f"{now:%Y-%m}/{now:%Y-%m-%d}_{now:%H%M%S}_{_slug(type_clean)}_{name}"
+
+    s3 = get_s3()
+    uploaded = photo_n = video_n = 0
+    for item in media_list:
+        try:
+            if item["type"] == "photo":
+                photo_n += 1
+                key = f"{folder}/photo_{photo_n:02d}.jpg"
+                content_type = "image/jpeg"
+            else:
+                video_n += 1
+                key = f"{folder}/video_{video_n:02d}.mp4"
+                content_type = "video/mp4"
+
+            file = await bot.get_file(item["file_id"])
+            buf = await bot.download_file(file.file_path)  # BytesIO
+            buf.seek(0)
+            await asyncio.to_thread(
+                s3.upload_fileobj, buf, S3_BUCKET, key, {"ContentType": content_type}
+            )
+            uploaded += 1
+        except Exception as e:
+            logger.error("S3: не удалось залить %s: %s", item.get("file_id"), e)
+
+    # Рядом кладём текстовое описание объекта
+    try:
+        body = build_caption(data).encode("utf-8")
+        await asyncio.to_thread(
+            s3.put_object,
+            Bucket=S3_BUCKET,
+            Key=f"{folder}/описание.txt",
+            Body=body,
+            ContentType="text/plain; charset=utf-8",
+        )
+    except Exception as e:
+        logger.error("S3: не удалось залить описание: %s", e)
+
+    logger.info("S3: загружено %d/%d файлов → %s", uploaded, len(media_list), folder)
+    return uploaded
 
 
 async def show_preview(message: Message, data: dict):
@@ -260,12 +359,21 @@ async def send_to_group(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await bot.send_message(chat_id=GROUP_ID, text=caption, parse_mode="HTML")
 
     await callback.message.edit_text("✅ Отправлено в группу!")
+
+    # Архив в приватный бакет Яндекса (если настроены ключи)
+    archived = 0
+    try:
+        archived = await archive_media_to_s3(bot, data)
+    except Exception as e:
+        logger.error("S3: архивация не удалась: %s", e)
+
     await state.clear()
 
     # Предлагаем создать новый объект
-    await callback.message.answer(
-        "Можете отправить данные следующего объекта.",
-    )
+    next_msg = "Можете отправить данные следующего объекта."
+    if archived:
+        next_msg = f"☁️ В архив загружено: {archived} файл(ов).\n\n" + next_msg
+    await callback.message.answer(next_msg)
     await state.set_state(ObjectForm.text)
 
 
