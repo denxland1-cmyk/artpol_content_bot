@@ -138,7 +138,8 @@ async def archive_media_to_s3(bot: Bot, data: dict) -> int:
     obj_type = TYPE_LABELS.get(data.get("obj_type"), "объект")
     type_clean = obj_type.split(" ", 1)[-1] if " " in obj_type else obj_type  # без эмодзи
     name = _slug(data.get("user_name", "бригадир"))
-    folder = f"{now:%Y-%m}/{now:%Y-%m-%d}_{now:%H%M%S}_{_slug(type_clean)}_{name}"
+    # месяц → день → объект (время в имени объекта, секунды для уникальности)
+    folder = f"{now:%Y-%m}/{now:%Y-%m-%d}/{now:%H-%M-%S}_{_slug(type_clean)}_{name}"
 
     s3 = get_s3()
     uploaded = photo_n = video_n = 0
