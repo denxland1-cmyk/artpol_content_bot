@@ -15,7 +15,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 
 load_dotenv()
 
@@ -219,13 +219,38 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(ObjectForm.text)
 
 
-@router.message(ObjectForm.text, F.text)
+@router.message(StateFilter(None, ObjectForm.text), F.text)
 async def receive_text(message: Message, state: FSMContext):
+    # Точка входа: ловит текст и в начале диалога, и БЕЗ состояния (после
+    # перезапуска бота) — поэтому /start больше не обязателен.
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return
+    if message.text.startswith("/"):
+        await message.answer(
+            "Чтобы добавить объект, просто пришлите его данные текстом — "
+            "адрес, клиент, площадь, координаты."
+        )
+        return
     user = message.from_user
     user_name = user.full_name or user.username or "Неизвестный"
     await state.update_data(text=message.text, media=[], user_name=user_name)
     await message.answer("Выберите тип объекта:", reply_markup=type_keyboard())
     await state.set_state(ObjectForm.obj_type)
+
+
+@router.message(StateFilter(None))
+async def no_state_hint(message: Message, state: FSMContext):
+    # Любое нетекстовое сообщение без состояния (фото/видео после перезапуска) —
+    # подсказываем, а не молчим.
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("⛔ У вас нет доступа к этому боту.")
+        return
+    await message.answer(
+        "👋 Пришлите данные объекта <b>текстом</b> (адрес, клиент, площадь, координаты) — "
+        "и я проведу по шагам. Команда /start не нужна.",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(ObjectForm.obj_type, F.data.startswith("type_"))
@@ -240,6 +265,11 @@ async def receive_type(callback: CallbackQuery, state: FSMContext):
         ]),
     )
     await state.set_state(ObjectForm.media)
+
+
+@router.message(ObjectForm.obj_type)
+async def obj_type_wrong(message: Message):
+    await message.answer("Выберите тип объекта кнопкой ниже 👇", reply_markup=type_keyboard())
 
 
 @router.message(ObjectForm.media, F.photo)
@@ -383,6 +413,11 @@ async def send_to_group(callback: CallbackQuery, state: FSMContext, bot: Bot):
 @router.message(ObjectForm.media)
 async def media_wrong_type(message: Message):
     await message.answer("⚠️ Отправьте фото или видео. Другие типы файлов не принимаются.")
+
+
+@router.message(ObjectForm.confirm)
+async def confirm_wrong(message: Message):
+    await message.answer("Почти готово — нажмите ✅ Отправить или ✏️ Править.")
 
 
 # ── Main ────────────────────────────────────────────────────
