@@ -67,6 +67,15 @@ ALLOWED_USERS = {
     7925638273,   # Сергей Григорьев (руководитель)
 }
 
+# Канонические имена бригадиров по Telegram-ID — корневые папки в архиве.
+# Объекты не-бригадиров (Денис/Сергей/прочие) складываются в «Прочее».
+FOREMAN_NAMES = {
+    1670809909: "Саня",
+    6016286196: "Женя",
+    5399664883: "Паша",
+    6441794225: "Диман",
+}
+
 router = Router()
 
 
@@ -137,9 +146,9 @@ async def archive_media_to_s3(bot: Bot, data: dict) -> int:
     now = datetime.now(MSK)
     obj_type = TYPE_LABELS.get(data.get("obj_type"), "объект")
     type_clean = obj_type.split(" ", 1)[-1] if " " in obj_type else obj_type  # без эмодзи
-    name = _slug(data.get("user_name", "бригадир"))
-    # месяц → день → объект (время в имени объекта, секунды для уникальности)
-    folder = f"{now:%Y-%m}/{now:%Y-%m-%d}/{now:%H-%M-%S}_{_slug(type_clean)}_{name}"
+    foreman = FOREMAN_NAMES.get(data.get("user_id"), "Прочее")
+    # бригадир → месяц → объект (дата+время+тип в имени объекта)
+    folder = f"{_slug(foreman)}/{now:%Y-%m}/{now:%d.%m}_{now:%H-%M}_{_slug(type_clean)}"
 
     s3 = get_s3()
     uploaded = photo_n = video_n = 0
@@ -234,7 +243,7 @@ async def receive_text(message: Message, state: FSMContext):
         return
     user = message.from_user
     user_name = user.full_name or user.username or "Неизвестный"
-    await state.update_data(text=message.text, media=[], user_name=user_name)
+    await state.update_data(text=message.text, media=[], user_name=user_name, user_id=user.id)
     await message.answer("Выберите тип объекта:", reply_markup=type_keyboard())
     await state.set_state(ObjectForm.obj_type)
 
