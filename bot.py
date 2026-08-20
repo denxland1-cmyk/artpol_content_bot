@@ -83,6 +83,8 @@ router = Router()
 class ObjectForm(StatesGroup):
     text = State()           # ввод текста объекта
     obj_type = State()       # выбор типа: Квартира / Дом / Коммерция
+    workers = State()        # сколько человек работало
+    hours = State()          # сколько часов заняло
     media = State()          # загрузка фото и видео
     confirm = State()        # подтверждение / редактирование
 
@@ -95,6 +97,27 @@ def type_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏠 Дом", callback_data="type_house"),
             InlineKeyboardButton(text="🏗 Коммерция", callback_data="type_commercial"),
         ]
+    ])
+
+
+def workers_keyboard() -> InlineKeyboardMarkup:
+    """Сколько человек. Кнопками: бригадир отвечает на объекте, руки заняты."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n}", callback_data=f"wrk_{n}") for n in (1, 2, 3)],
+        [InlineKeyboardButton(text=f"{n}", callback_data=f"wrk_{n}") for n in (4, 5, 6)],
+        [InlineKeyboardButton(text="7 и больше", callback_data="wrk_7+"),
+         InlineKeyboardButton(text="не считал", callback_data="wrk_skip")],
+    ])
+
+
+def hours_keyboard() -> InlineKeyboardMarkup:
+    """Сколько часов заняло. Тоже кнопками."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n} ч", callback_data=f"hrs_{n}") for n in (3, 4, 5)],
+        [InlineKeyboardButton(text=f"{n} ч", callback_data=f"hrs_{n}") for n in (6, 7, 8)],
+        [InlineKeyboardButton(text="9 и больше", callback_data="hrs_9+"),
+         InlineKeyboardButton(text="два дня", callback_data="hrs_2days")],
+        [InlineKeyboardButton(text="не считал", callback_data="hrs_skip")],
     ])
 
 
@@ -111,6 +134,7 @@ def edit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Текст", callback_data="edit_text")],
         [InlineKeyboardButton(text="🏷 Тип объекта", callback_data="edit_type")],
+        [InlineKeyboardButton(text="👷 Человек и часы", callback_data="edit_crew")],
         [InlineKeyboardButton(text="📸 Фото/Видео", callback_data="edit_media")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_confirm")],
     ])
@@ -128,7 +152,16 @@ def build_caption(data: dict) -> str:
     obj_type = TYPE_LABELS.get(data.get("obj_type"), "")
     date = datetime.now(MSK).strftime("%d.%m.%Y")
     name = data.get("user_name", "")
-    return f"{obj_type}\n📅 {date} | 👷 {name}\n\n{data.get('text', '')}"
+    crew = []
+    if data.get("workers"):
+        w = data["workers"]
+        crew.append(f"👷 {w} чел." if w != "7+" else "👷 7+ чел.")
+    if data.get("hours"):
+        h = data["hours"]
+        crew.append("⏱ два дня" if h == "2days" else (f"⏱ {h} ч" if h != "9+" else "⏱ 9+ ч"))
+    crew_line = ("\n" + " · ".join(crew)) if crew else ""
+    return (f"{obj_type}\n📅 {date} | 👷 {name}{crew_line}\n\n"
+            f"{data.get('text', '')}")
 
 
 async def archive_media_to_s3(bot: Bot, data: dict) -> int:
@@ -267,6 +300,19 @@ async def receive_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(obj_type=callback.data)
     await callback.message.edit_text(
         f"Тип: {TYPE_LABELS[callback.data]}\n\n"
+        "👷 Сколько человек работало на объекте?",
+        reply_markup=workers_keyboard(),
+    )
+    await state.set_state(ObjectForm.workers)
+
+
+# ── Люди и часы ─────────────────────────────────────────────
+# Эти два поля добавлены 19.08.2026 по просьбе Дениса. Без них в описании
+# объекта не было ни сроков, ни состава бригады — и агент, писавший посты,
+# дважды выдумывал «за один выезд». Теперь данные приходят из первых рук.
+
+async def ask_media(message, state: FSMContext) -> None:
+    await message.edit_text(
         "📸 Теперь загрузите фото и видео.\n"
         "Когда закончите — нажмите кнопку ниже.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -274,6 +320,49 @@ async def receive_type(callback: CallbackQuery, state: FSMContext):
         ]),
     )
     await state.set_state(ObjectForm.media)
+
+
+@router.callback_query(ObjectForm.workers, F.data.startswith("wrk_"))
+async def receive_workers(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.removeprefix("wrk_")
+    await state.update_data(workers="" if value == "skip" else value)
+    await callback.message.edit_text(
+        "⏱ Сколько времени заняла работа?",
+        reply_markup=hours_keyboard(),
+    )
+    await state.set_state(ObjectForm.hours)
+
+
+@router.message(ObjectForm.workers)
+async def workers_wrong(message: Message):
+    await message.answer("Выберите кнопкой ниже 👇", reply_markup=workers_keyboard())
+
+
+@router.callback_query(ObjectForm.hours, F.data.startswith("hrs_"))
+async def receive_hours(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.removeprefix("hrs_")
+    await state.update_data(hours="" if value == "skip" else value)
+    data = await state.get_data()
+    if data.get("media"):          # правка с экрана подтверждения — фото уже есть
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await show_preview(callback.message, data)
+        await state.set_state(ObjectForm.confirm)
+        return
+    await ask_media(callback.message, state)
+
+
+@router.message(ObjectForm.hours)
+async def hours_wrong(message: Message):
+    await message.answer("Выберите кнопкой ниже 👇", reply_markup=hours_keyboard())
+
+
+@router.callback_query(ObjectForm.confirm, F.data == "edit_crew")
+async def edit_crew_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "👷 Сколько человек работало на объекте?",
+        reply_markup=workers_keyboard(),
+    )
+    await state.set_state(ObjectForm.workers)
 
 
 @router.message(ObjectForm.obj_type)
@@ -431,10 +520,43 @@ async def confirm_wrong(message: Message):
 
 # ── Main ────────────────────────────────────────────────────
 
+def get_s3_read():
+    """Клиент для чтения бакета: отдельные read-ключи, иначе основные."""
+    key = os.getenv("S3_READ_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+    secret = os.getenv("S3_READ_SECRET") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    if not os.getenv("S3_READ_KEY_ID"):
+        return get_s3()
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        "s3", endpoint_url=S3_ENDPOINT, aws_access_key_id=key,
+        aws_secret_access_key=secret, config=Config(signature_version="s3v4"),
+        region_name=S3_REGION,
+    )
+
+
+def start_reminders(bot: Bot) -> None:
+    """Ежедневная сверка «план заливок ↔ присланный контент» (если настроена)."""
+    if not (S3_ENABLED and os.getenv("KRONOS_API_KEY")):
+        logger.info("напоминания выключены (нет KRONOS_API_KEY или ключей S3)")
+        return
+    try:
+        from datetime import date as _date
+        import reminders
+        start_from = _date.fromisoformat(
+            os.getenv("REMINDERS_START", datetime.now(MSK).date().isoformat()))
+        foreman_ids = {name: uid for uid, name in FOREMAN_NAMES.items()}
+        asyncio.create_task(reminders.reminder_loop(
+            bot, get_s3_read(), get_s3(), S3_BUCKET, foreman_ids, start_from))
+    except Exception as e:
+        logger.error("не удалось запустить напоминания: %s", e)
+
+
 async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    start_reminders(bot)
     print("Bot started...")
     await dp.start_polling(bot)
 
