@@ -83,6 +83,8 @@ router = Router()
 class ObjectForm(StatesGroup):
     text = State()           # ввод текста объекта
     obj_type = State()       # выбор типа: Квартира / Дом / Коммерция
+    place = State()          # населённый пункт (кнопкой или текстом)
+    district = State()       # район НН — только если выбран Нижний Новгород
     workers = State()        # сколько человек работало
     hours = State()          # сколько часов заняло
     media = State()          # загрузка фото и видео
@@ -98,6 +100,31 @@ def type_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏗 Коммерция", callback_data="type_commercial"),
         ]
     ])
+
+
+# Направления взяты из выгрузки заказов за год: это все, где у нас были продажи.
+# Порядок — по числу заказов, чтобы частое было первым и попадало под палец.
+PLACES = ["Нижний Новгород", "Бор", "Кстово", "Богородск",
+          "Дзержинск", "Балахна", "Павлово", "Городец"]
+NN_DISTRICTS = ["Автозаводский", "Сормовский", "Канавинский", "Ленинский",
+                "Московский", "Нижегородский", "Советский", "Приокский"]
+
+
+def place_keyboard() -> InlineKeyboardMarkup:
+    """Населённый пункт кнопкой: бригадир отвечает на объекте, руки заняты."""
+    rows = [[InlineKeyboardButton(text=PLACES[i], callback_data=f"plc_{i}"),
+             InlineKeyboardButton(text=PLACES[i + 1], callback_data=f"plc_{i + 1}")]
+            for i in range(0, len(PLACES), 2)]
+    rows.append([InlineKeyboardButton(text="✏️ Другой — напишу", callback_data="plc_other")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def district_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=NN_DISTRICTS[i], callback_data=f"dst_{i}"),
+             InlineKeyboardButton(text=NN_DISTRICTS[i + 1], callback_data=f"dst_{i + 1}")]
+            for i in range(0, len(NN_DISTRICTS), 2)]
+    rows.append([InlineKeyboardButton(text="не знаю", callback_data="dst_skip")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def workers_keyboard() -> InlineKeyboardMarkup:
@@ -134,6 +161,7 @@ def edit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Текст", callback_data="edit_text")],
         [InlineKeyboardButton(text="🏷 Тип объекта", callback_data="edit_type")],
+        [InlineKeyboardButton(text="📍 Населённый пункт", callback_data="edit_place")],
         [InlineKeyboardButton(text="👷 Человек и часы", callback_data="edit_crew")],
         [InlineKeyboardButton(text="📸 Фото/Видео", callback_data="edit_media")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_confirm")],
@@ -145,6 +173,13 @@ TYPE_LABELS = {
     "type_apartment": "🏢 Квартира",
     "type_house": "🏠 Дом",
     "type_commercial": "🏗 Коммерция",
+}
+
+
+MIME_EXT = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/webp": "webp", "image/heic": "heic", "image/heif": "heic",
+    "video/mp4": "mp4", "video/quicktime": "mov",
 }
 
 
@@ -160,7 +195,14 @@ def build_caption(data: dict) -> str:
         h = data["hours"]
         crew.append("⏱ два дня" if h == "2days" else (f"⏱ {h} ч" if h != "9+" else "⏱ 9+ ч"))
     crew_line = ("\n" + " · ".join(crew)) if crew else ""
-    return (f"{obj_type}\n📅 {date} | 👷 {name}{crew_line}\n\n"
+    # Отдельная строка «Населённый пункт» — чтобы гео читалось машинно, а не
+    # выковыривалось из свободного текста. До неё адрес брался из описания и
+    # определялся у 39 объектов из 75; у остальных мешал формат записи.
+    place = data.get("place", "")
+    if place and data.get("district"):
+        place = f"{place}, {data['district']} р-н"
+    place_line = f"\n📍 Населённый пункт: {place}" if place else ""
+    return (f"{obj_type}\n📅 {date} | 👷 {name}{crew_line}{place_line}\n\n"
             f"{data.get('text', '')}")
 
 
@@ -187,14 +229,21 @@ async def archive_media_to_s3(bot: Bot, data: dict) -> int:
     uploaded = photo_n = video_n = 0
     for item in media_list:
         try:
+            # Фото, присланное файлом, может быть png или heic — раньше всё
+            # ложилось как .jpg с типом image/jpeg, и оригинал портился в
+            # метаданных. Расширение берём из mime, дальше по имени файла.
             if item["type"] == "photo":
                 photo_n += 1
-                key = f"{folder}/photo_{photo_n:02d}.jpg"
-                content_type = "image/jpeg"
+                content_type = item.get("mime") or "image/jpeg"
+                ext = MIME_EXT.get(content_type) or os.path.splitext(
+                    item.get("file_name", ""))[1].lstrip(".").lower() or "jpg"
+                suffix = "" if item.get("compressed", True) else "_orig"
+                key = f"{folder}/photo_{photo_n:02d}{suffix}.{ext}"
             else:
                 video_n += 1
-                key = f"{folder}/video_{video_n:02d}.mp4"
-                content_type = "video/mp4"
+                content_type = item.get("mime") or "video/mp4"
+                ext = MIME_EXT.get(content_type) or "mp4"
+                key = f"{folder}/video_{video_n:02d}.{ext}"
 
             file = await bot.get_file(item["file_id"])
             buf = await bot.download_file(file.file_path)  # BytesIO
@@ -300,10 +349,64 @@ async def receive_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(obj_type=callback.data)
     await callback.message.edit_text(
         f"Тип: {TYPE_LABELS[callback.data]}\n\n"
-        "👷 Сколько человек работало на объекте?",
-        reply_markup=workers_keyboard(),
+        "📍 Где объект? Населённый пункт:",
+        reply_markup=place_keyboard(),
     )
+    await state.set_state(ObjectForm.place)
+
+
+# ── Населённый пункт ────────────────────────────────────────
+# Добавлено 21.08.2026: фото объектов идут на гео-страницы сайта, а привязать
+# кадр к странице можно только по населённому пункту. Раньше адрес жил внутри
+# свободного текста и вычитывался у 39 объектов из 75 — у остальных мешал формат.
+
+async def ask_workers(message, state: FSMContext) -> None:
+    await message.edit_text("👷 Сколько человек работало на объекте?",
+                            reply_markup=workers_keyboard())
     await state.set_state(ObjectForm.workers)
+
+
+@router.callback_query(ObjectForm.place, F.data.startswith("plc_"))
+async def receive_place(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.removeprefix("plc_")
+    if value == "other":
+        await callback.message.edit_text(
+            "📍 Напишите населённый пункт — город, посёлок или деревню.\n"
+            "<i>Номер дома и квартиру писать не нужно, они и так есть в описании.</i>",
+            parse_mode="HTML")
+        return
+    place = PLACES[int(value)]
+    await state.update_data(place=place, district="")
+    if place == "Нижний Новгород":
+        await callback.message.edit_text("📍 Район города:", reply_markup=district_keyboard())
+        await state.set_state(ObjectForm.district)
+        return
+    await ask_workers(callback.message, state)
+
+
+@router.message(ObjectForm.place, F.text)
+async def receive_place_text(message: Message, state: FSMContext):
+    await state.update_data(place=message.text.strip(), district="")
+    sent = await message.answer("👷 Сколько человек работало на объекте?",
+                                reply_markup=workers_keyboard())
+    await state.set_state(ObjectForm.workers)
+
+
+@router.message(ObjectForm.place)
+async def place_wrong(message: Message):
+    await message.answer("Выберите населённый пункт кнопкой или напишите его текстом.")
+
+
+@router.callback_query(ObjectForm.district, F.data.startswith("dst_"))
+async def receive_district(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.removeprefix("dst_")
+    await state.update_data(district="" if value == "skip" else NN_DISTRICTS[int(value)])
+    await ask_workers(callback.message, state)
+
+
+@router.message(ObjectForm.district)
+async def district_wrong(message: Message):
+    await message.answer("Выберите район кнопкой.")
 
 
 # ── Люди и часы ─────────────────────────────────────────────
@@ -313,8 +416,12 @@ async def receive_type(callback: CallbackQuery, state: FSMContext):
 
 async def ask_media(message, state: FSMContext) -> None:
     await message.edit_text(
-        "📸 Теперь загрузите фото и видео.\n"
+        "📸 Теперь загрузите фото и видео.\n\n"
+        "<b>Лучше присылать файлом</b> — скрепка → «Файл». Телеграм не сожмёт кадр, "
+        "и он пойдёт на сайт и в соцсети в полном качестве.\n"
+        "Обычным фото тоже принимается, просто качество будет ниже.\n\n"
         "Когда закончите — нажмите кнопку ниже.",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Готово", callback_data="media_done")]
         ]),
@@ -372,11 +479,24 @@ async def obj_type_wrong(message: Message):
 
 @router.message(ObjectForm.media, F.photo)
 async def receive_photo(message: Message, state: FSMContext):
+    """Обычное фото — Телеграм жмёт его до 1280 px по длинной стороне.
+
+    Для соцсетей это ещё терпимо, для сайта уже мало: крупный план фактуры из
+    такого кадра не сделать, а апскейлить нечего. Поэтому один раз за объект
+    подсказываем про отправку файлом — но кадр всё равно принимаем.
+    """
     data = await state.get_data()
     media = data.get("media", [])
-    media.append({"type": "photo", "file_id": message.photo[-1].file_id})
+    media.append({"type": "photo", "file_id": message.photo[-1].file_id,
+                  "compressed": True})
     await state.update_data(media=media)
-    await message.answer(f"📷 Фото принято (всего: {len(media)}). Ещё или нажмите «Готово».")
+    hint = ""
+    if not data.get("hinted_compress"):
+        await state.update_data(hinted_compress=True)
+        hint = ("\n\n💡 Это фото пришло сжатым. Если не сложно — присылайте "
+                "скрепка → «Файл»: тогда кадр не портится и годится на сайт.")
+    await message.answer(f"📷 Фото принято (всего: {len(media)}). "
+                         f"Ещё или нажмите «Готово».{hint}")
 
 
 @router.message(ObjectForm.media, F.video)
@@ -393,12 +513,16 @@ async def receive_document(message: Message, state: FSMContext):
     mime = message.document.mime_type or ""
     data = await state.get_data()
     media = data.get("media", [])
+    name = message.document.file_name or ""
     if mime.startswith("image/"):
-        media.append({"type": "photo", "file_id": message.document.file_id})
+        media.append({"type": "photo", "file_id": message.document.file_id,
+                      "compressed": False, "mime": mime, "file_name": name})
         await state.update_data(media=media)
-        await message.answer(f"📷 Фото принято (всего: {len(media)}). Ещё или нажмите «Готово».")
+        await message.answer(f"📷 Фото принято без сжатия (всего: {len(media)}). "
+                             f"Ещё или нажмите «Готово».")
     elif mime.startswith("video/"):
-        media.append({"type": "video", "file_id": message.document.file_id})
+        media.append({"type": "video", "file_id": message.document.file_id,
+                      "compressed": False, "mime": mime, "file_name": name})
         await state.update_data(media=media)
         await message.answer(f"🎬 Видео принято (всего: {len(media)}). Ещё или нажмите «Готово».")
     else:
@@ -433,6 +557,12 @@ async def edit_text_prompt(callback: CallbackQuery, state: FSMContext):
 async def edit_type_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выберите новый тип объекта:", reply_markup=type_keyboard())
     await state.set_state(ObjectForm.obj_type)
+
+
+@router.callback_query(ObjectForm.confirm, F.data == "edit_place")
+async def edit_place_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("📍 Населённый пункт:", reply_markup=place_keyboard())
+    await state.set_state(ObjectForm.place)
 
 
 @router.callback_query(ObjectForm.confirm, F.data == "edit_media")
