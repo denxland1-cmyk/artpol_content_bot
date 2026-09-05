@@ -417,9 +417,11 @@ async def district_wrong(message: Message):
 async def ask_media(message, state: FSMContext) -> None:
     await message.edit_text(
         "📸 Теперь загрузите фото и видео.\n\n"
-        "<b>Лучше присылать файлом</b> — скрепка → «Файл». Телеграм не сожмёт кадр, "
-        "и он пойдёт на сайт и в соцсети в полном качестве.\n"
-        "Обычным фото тоже принимается, просто качество будет ниже.\n\n"
+        "⚠️ <b>Фото — только файлом</b>: скрепка 📎 → «Файл».\n"
+        "📱 Android: 📎 → «Файл» → «Галерея»\n"
+        "🍏 iPhone: 📎 → «Файл»\n\n"
+        "Иначе Телеграм сожмёт кадр и он не пойдёт на сайт — такие бот не примет.\n"
+        "Видео можно отправлять обычным способом.\n\n"
         "Когда закончите — нажмите кнопку ниже.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -479,24 +481,28 @@ async def obj_type_wrong(message: Message):
 
 @router.message(ObjectForm.media, F.photo)
 async def receive_photo(message: Message, state: FSMContext):
-    """Обычное фото — Телеграм жмёт его до 1280 px по длинной стороне.
+    """Сжатое фото не принимаем.
 
-    Для соцсетей это ещё терпимо, для сайта уже мало: крупный план фактуры из
-    такого кадра не сделать, а апскейлить нечего. Поэтому один раз за объект
-    подсказываем про отправку файлом — но кадр всё равно принимаем.
+    Телеграм режет кадр до 1280 px ещё на телефоне отправителя — оригинал до бота
+    физически не доходит, восстановить его потом неоткуда. Для сайта и печати это
+    негодный материал, поэтому просим переслать файлом. Отвечаем один раз на альбом:
+    иначе на серию из десяти кадров бригадир получит десять одинаковых отказов.
     """
     data = await state.get_data()
-    media = data.get("media", [])
-    media.append({"type": "photo", "file_id": message.photo[-1].file_id,
-                  "compressed": True})
-    await state.update_data(media=media)
-    hint = ""
-    if not data.get("hinted_compress"):
-        await state.update_data(hinted_compress=True)
-        hint = ("\n\n💡 Это фото пришло сжатым. Если не сложно — присылайте "
-                "скрепка → «Файл»: тогда кадр не портится и годится на сайт.")
-    await message.answer(f"📷 Фото принято (всего: {len(media)}). "
-                         f"Ещё или нажмите «Готово».{hint}")
+    gid = message.media_group_id or f"m{message.message_id}"
+    if data.get("rejected_group") == gid:
+        return
+    await state.update_data(rejected_group=gid)
+    accepted = len(data.get("media", []))
+    await message.answer(
+        "⚠️ <b>Фото пришло сжатым</b> — Телеграм урезал качество, "
+        "на сайт такой кадр не пойдёт.\n\n"
+        "Пришлите это же фото <b>файлом</b>:\n"
+        "📱 <b>Android</b>: скрепка 📎 → «Файл» → «Галерея» → выбрать фото\n"
+        "🍏 <b>iPhone</b>: скрепка 📎 → «Файл» → выбрать фото\n"
+        "(на iPhone можно иначе: выбрать фото, зажать ➤ и «Отправить без сжатия»)\n\n"
+        f"Принято пока: {accepted} шт.",
+        parse_mode="HTML")
 
 
 @router.message(ObjectForm.media, F.video)
@@ -570,6 +576,7 @@ async def edit_media_prompt(callback: CallbackQuery, state: FSMContext):
     await state.update_data(media=[])
     await callback.message.edit_text(
         "📸 Загрузите фото и видео заново.\n"
+        "⚠️ Фото — только файлом (скрепка 📎 → «Файл»).\n"
         "Когда закончите — нажмите «Готово».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Готово", callback_data="media_done")]
