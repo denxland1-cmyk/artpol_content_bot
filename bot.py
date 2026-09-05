@@ -58,6 +58,24 @@ def _slug(text: str) -> str:
     return re.sub(r"[^\w\-]+", "_", (text or "").strip(), flags=re.UNICODE).strip("_") or "obj"
 
 
+def _heic_to_jpeg(data: bytes) -> bytes:
+    """HEIC (формат айфонов по умолчанию) → JPEG.
+
+    Сам HEIC не показывают ни Chrome, ни браузеры на Android — в галерее вместо
+    кадра была бы пустая плитка. Качество 95 визуально неотличимо от оригинала,
+    разрешение сохраняется целиком: пережимаем один раз из оригинала, а не из
+    уже сжатого кадра.
+    """
+    import io as _io
+    import pillow_heif
+    from PIL import Image
+    pillow_heif.register_heif_opener()
+    out = _io.BytesIO()
+    Image.open(_io.BytesIO(data)).convert("RGB").save(
+        out, format="JPEG", quality=95, optimize=True)
+    return out.getvalue()
+
+
 ALLOWED_USERS = {
     800204567,    # Денис Акценин (@denxland)
     1670809909,   # Саня
@@ -248,6 +266,19 @@ async def archive_media_to_s3(bot: Bot, data: dict) -> int:
             file = await bot.get_file(item["file_id"])
             buf = await bot.download_file(file.file_path)  # BytesIO
             buf.seek(0)
+
+            if item["type"] == "photo" and content_type in ("image/heic", "image/heif"):
+                try:
+                    jpeg = await asyncio.to_thread(_heic_to_jpeg, buf.getvalue())
+                    buf = BytesIO(jpeg)
+                    content_type = "image/jpeg"
+                    key = key.rsplit(".", 1)[0] + ".jpg"
+                    logger.info("HEIC→JPEG: %s (%.1f МБ)", key, len(jpeg) / 1048576)
+                except Exception as e:
+                    # Лучше положить исходный heic, чем потерять кадр совсем.
+                    logger.error("HEIC→JPEG не удался, заливаю как есть: %s", e)
+                    buf.seek(0)
+
             await asyncio.to_thread(
                 s3.upload_fileobj, buf, S3_BUCKET, key, {"ContentType": content_type}
             )
