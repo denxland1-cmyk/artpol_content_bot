@@ -448,9 +448,9 @@ async def district_wrong(message: Message):
 async def ask_media(message, state: FSMContext) -> None:
     await message.edit_text(
         "📸 Теперь загрузите фото и видео.\n\n"
-        "<b>Лучше присылать файлом</b> — скрепка → «Файл». Телеграм не сожмёт кадр, "
-        "и он пойдёт на сайт и в соцсети в полном качестве.\n"
-        "Обычным фото тоже принимается, просто качество будет ниже.\n\n"
+        "Присылайте <b>как удобно</b> — обычным фото тоже подойдёт.\n"
+        "Если не трудно, можно скрепка 📎 → «Файл»: тогда качество выше, "
+        "но это не обязательно.\n\n"
         "Когда закончите — нажмите кнопку ниже.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -524,8 +524,8 @@ async def receive_photo(message: Message, state: FSMContext):
     hint = ""
     if not data.get("hinted_compress"):
         await state.update_data(hinted_compress=True)
-        hint = ("\n\n💡 Это фото пришло сжатым. Если не сложно — присылайте "
-                "скрепка → «Файл»: тогда кадр не портится и годится на сайт.")
+        hint = ("\n\n💡 Если не трудно — можно присылать через скрепку 📎 → «Файл», "
+                "качество будет лучше. Но и так нормально.")
     await message.answer(f"📷 Фото принято (всего: {len(media)}). "
                          f"Ещё или нажмите «Готово».{hint}")
 
