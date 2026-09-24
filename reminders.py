@@ -68,23 +68,56 @@ def _plan(d_from: date, d_to: date) -> dict:
     return plan
 
 
-def _sent(s3, bucket: str) -> dict:
-    """(бригадир, YYYY-MM-DD) → сколько объектов прислано."""
-    sent = defaultdict(int)
+def _submissions(s3, bucket: str, since: date) -> dict:
+    """бригадир → [(дата папки, текст описания)] за период от `since`.
+
+    Раньше сверка шла по паре (бригадир, дата папки). Но дата папки — это дата
+    ОТПРАВКИ, а бригады выкладывают не с объекта: Саня 21.09 отработал два
+    объекта и прислал их 22.09 в 05:59 и 06:01, перед выездом. Из-за этого
+    приходили напоминания о том, что уже прислано. Поэтому собираем ещё и текст
+    описания — по нему сверяем адрес, а не календарь.
+    """
+    subs = defaultdict(list)
     seen = set()
+    desc_keys = {}
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
         for obj in page.get("Contents", []):
             parts = obj["Key"].split("/")
             if len(parts) < 3:
                 continue
             folder = "/".join(parts[:3])
-            if folder in seen:
-                continue
-            seen.add(folder)
             m = re.match(r"(\d{2})\.(\d{2})_", parts[2])
-            if m:
-                sent[(parts[0], f"{parts[1][:4]}-{m.group(2)}-{m.group(1)}")] += 1
-    return sent
+            if not m:
+                continue
+            day = date.fromisoformat(f"{parts[1][:4]}-{m.group(2)}-{m.group(1)}")
+            if day < since:
+                continue
+            if folder not in seen:
+                seen.add(folder)
+                subs[parts[0]].append([day, ""])
+            if obj["Key"].endswith("писание.txt"):
+                desc_keys[folder] = (parts[0], day, obj["Key"])
+    # описания читаем только за нужный период — их немного
+    for foreman, day, key in desc_keys.values():
+        try:
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        for item in subs[foreman]:
+            if item[0] == day and not item[1]:
+                item[1] = body
+                break
+    return subs
+
+
+_STOP = {"квартира", "коммерция", "объект", "первый", "второй", "третий",
+         "улица", "город", "район", "участок", "основание", "этаж", "нижний"}
+
+
+def _tokens(text: str) -> set:
+    """Значимые слова адреса: длинные, без служебных. «Боталово», «Энергия»."""
+    norm = re.sub(r"[^\w\s]+", " ", (text or "").lower().replace("ё", "е"))
+    return {w for w in norm.split() if len(w) >= 5 and not w.isdigit() and w not in _STOP}
 
 
 def _load_state(s3, bucket: str) -> dict:
@@ -104,18 +137,41 @@ def _save_state(s3, bucket: str, state: dict) -> None:
         logger.error("не удалось сохранить состояние напоминаний: %s", e)
 
 
-def build_reminders(plan: dict, sent: dict, state: dict, today: date, start_from: date) -> dict:
-    """Бригадир → список строк «дата — объект», о которых стоит напомнить."""
+MATCH_WINDOW_DAYS = 7          # столько дней после работы ещё ждём выкладку
+
+
+def build_reminders(plan: dict, subs: dict, state: dict, today: date, start_from: date) -> dict:
+    """Бригадир → список строк «дата — объект», о которых стоит напомнить.
+
+    Объект считается закрытым, если у этого бригадира есть заливка, в описании
+    которой встречается адрес из плана Кроноса, и сделана она в окне от дня
+    работы до +7 дней. По календарю сверять нельзя: выкладывают на следующий
+    день и позже, из-за чего бот просил прислать то, что уже прислано.
+    """
     counts = state.get("counts", {})
     out = defaultdict(list)
+    used = set()                 # одна заливка не должна закрывать два объекта
     for (foreman, day), objects in sorted(plan.items()):
         d = date.fromisoformat(day)
         if d >= today or d < start_from:
-            continue                     # сегодняшние ещё рано, дораннее — «чистый лист»
-        missing = len(objects) - sent.get((foreman, day), 0)
-        if missing <= 0:
-            continue
-        for title in objects[:missing]:
+            continue             # сегодняшние ещё рано, дораннее — «чистый лист»
+        items = subs.get(foreman, [])
+        for title in objects:
+            want = _tokens(title)
+            matched = False
+            for i, (sub_day, desc) in enumerate(items):
+                if (foreman, i) in used:
+                    continue
+                if not (d - timedelta(days=1) <= sub_day <= d + timedelta(days=MATCH_WINDOW_DAYS)):
+                    continue
+                # адрес распознан — сверяем по нему; если нет, засчитываем любую
+                # заливку в окне, чтобы не напоминать вслепую
+                if (want and want & _tokens(desc)) or not want:
+                    used.add((foreman, i))
+                    matched = True
+                    break
+            if matched:
+                continue
             key = f"{foreman}|{day}|{title[:30]}"
             if counts.get(key, 0) >= MAX_PER_OBJECT:
                 continue
@@ -139,10 +195,12 @@ async def run_once(bot, s3_read, s3_write, bucket: str, foreman_ids: dict, start
     today = datetime.now(MSK).date()
     d_from = max(today - timedelta(days=LOOKBACK_DAYS), start_from)
     plan = await asyncio.to_thread(_plan, d_from, today)
-    sent = await asyncio.to_thread(_sent, s3_read, bucket)
+    # заливки берём с запасом: объект могли выложить сильно позже дня работы
+    since = d_from - timedelta(days=1)
+    subs = await asyncio.to_thread(_submissions, s3_read, bucket, since)
     state = await asyncio.to_thread(_load_state, s3_read, bucket)
 
-    reminders = build_reminders(plan, sent, state, today, start_from)
+    reminders = build_reminders(plan, subs, state, today, start_from)
     delivered = 0
     for foreman, lines in reminders.items():
         chat_id = foreman_ids.get(foreman)
